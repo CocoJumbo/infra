@@ -1,8 +1,49 @@
 - hosts: all
   become: yes
   tasks:
+
     - name: Disable swap
       command: swapoff -a
+
+    - name: Install dependencies
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+        state: present
+        update_cache: yes
+
+    - name: Add Kubernetes apt key
+      ansible.builtin.apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        state: present
+
+    - name: Add Kubernetes apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb https://apt.kubernetes.io/ kubernetes-xenial main"
+        state: present
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install Kubernetes packages
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Hold Kubernetes packages at current version
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        mark_hold: yes
 
     - name: Install Docker
       apt:
@@ -10,16 +51,11 @@
         state: present
         update_cache: yes
 
-    - name: Install Kubernetes packages
-      apt:
-        name: ['kubelet', 'kubeadm', 'kubectl']
-        state: present
-        update_cache: yes
-
     - name: Initialize Kubernetes (only on master)
       command: kubeadm init --pod-network-cidr=10.244.0.0/16
       args:
         creates: /etc/kubernetes/admin.conf
+      when: inventory_hostname in groups['masters']
 
     - name: Set up kubeconfig for current user
       copy:
