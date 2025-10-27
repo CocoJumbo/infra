@@ -1,0 +1,269 @@
+- hosts: all
+  become: yes
+  tasks:
+
+    - name: Disable swap
+      command: swapoff -a
+
+    - name: Ensure swap is disabled on boot
+      replace:
+        path: /etc/fstab
+        regexp: '^\s*(.+\s+swap\s+.+)$'
+        replace: '# \1'
+
+    - name: Update and upgrade the system
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Install base dependencies
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg2
+          - software-properties-common
+        state: present
+
+    - name: Ensure kernel modules file for Kubernetes exists
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Load overlay module
+      modprobe:
+        name: overlay
+        state: present
+
+    - name: Load br_netfilter module
+      modprobe:
+        name: br_netfilter
+        state: present
+
+    - name: Configure Kubernetes sysctl parameters
+      copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Apply sysctl parameters
+      command: sysctl --system
+
+    - name: Disable and stop UFW firewall
+      systemd:
+        name: ufw
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+
+    - name: Set CRI-O environment variables
+      set_fact:
+        os_version: "xUbuntu_22.04"
+        crio_version: "1.25"
+
+    - name: Add libcontainers stable repository
+      lineinfile:
+        path: "/etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list"
+        line: "deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/{{ os_version }}/ /"
+        create: yes
+
+    - name: Add CRI-O version repository
+      lineinfile:
+        path: "/etc/apt/sources.list.d/devel:kubic:libcontainers:stable:cri-o:{{ crio_version }}.list"
+        line: "deb http://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/{{ crio_version }}/{{ os_version }}/ /"
+        create: yes
+
+    - name: Add repository keys for CRI-O
+      apt_key:
+        url: "https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/{{ os_version }}/Release.key"
+        state: present
+
+    - name: Add repository keys for CRI-O version
+      apt_key:
+        url: "https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable:cri-o:{{ crio_version }}/{{ os_version }}/Release.key"
+        state: present
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install CRI-O and dependencies
+      apt:
+        name:
+          - cri-o
+          - cri-o-runc
+          - cri-tools
+        state: present
+        update_cache: yes
+
+    - name: Enable and start CRI-O service
+      systemd:
+        name: crio
+        enabled: yes
+        state: started
+
+    - name: Install CNI plugin binaries
+      ansible.builtin.shell: |
+        mkdir -p /opt/cni/bin
+        curl -L https://github.com/containernetworking/plugins/releases/download/v1.2.0/cni-plugins-linux-amd64-v1.2.0.tgz | tar -xz -C /opt/cni/bin
+      args:
+        creates: /opt/cni/bin/bridge
+
+    - name: Restart CRI-O to pick up CNI plugins
+      systemd:
+        name: crio
+        state: restarted
+        enabled: yes
+
+    - name: Verify CRI-O service status
+      command: systemctl status crio
+      register: crio_status
+      changed_when: false
+
+    - name: Print CRI-O status output
+      debug:
+        var: crio_status.stdout
+
+    - name: Add Kubernetes apt key
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | \
+        gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes repository
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install Kubernetes components
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Hold Kubernetes package versions
+      command: apt-mark hold kubelet kubeadm kubectl
+
+    - name: Initialize Kubernetes control-plane
+      block:
+        - name: Run kubeadm init
+          command: kubeadm init --pod-network-cidr=10.244.0.0/16 --cri-socket /var/run/crio/crio.sock
+          args:
+            creates: /etc/kubernetes/admin.conf
+          register: kubeadm_init
+          retries: 3
+          delay: 30
+          until: kubeadm_init.rc == 0
+
+        - name: Wait for kube-apiserver to be ready
+          shell: |
+            kubectl get pods -n kube-system -l component=kube-apiserver -o jsonpath='{.items[0].status.phase}'
+          register: apiserver_status
+          retries: 20
+          delay: 15
+          until: apiserver_status.stdout == "Running"
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Ensure .kube directory exists
+      file:
+        path: "{{ ansible_env.HOME }}/.kube"
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+
+    - name: Copy admin.conf to user's kube config
+      copy:
+        remote_src: yes
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ ansible_env.HOME }}/.kube/config"
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+        mode: '0600'
+
+    - name: Ensure kubectl is available
+      command: which kubectl
+      register: kubectl_check
+      failed_when: kubectl_check.rc != 0
+      changed_when: false
+
+    - name: Configure kubelet to use CRI-O (modern Kubernetes)
+      ansible.builtin.lineinfile:
+        path: /etc/default/kubelet
+        regexp: '^KUBELET_EXTRA_ARGS='
+        line: 'KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///var/run/crio/crio.sock'
+        create: yes
+
+    - name: Reload systemd and restart kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+        daemon_reload: yes
+        enabled: yes
+
+    - name: Wait until node is Ready
+      shell: |
+        until kubectl get nodes | grep -w $(hostname) | grep -w Ready; do
+          sleep 5
+        done
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      retries: 30
+      delay: 10
+      register: node_ready
+      until: node_ready.rc == 0
+      changed_when: false
+
+    # --- Apply Flannel CNI ---
+    - name: Apply Flannel CNI manifest
+      shell: |
+        kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: apply_flannel
+      changed_when: "'configured' in apply_flannel.stdout or 'created' in apply_flannel.stdout"
+
+    # --- Wait for Flannel pods to be running ---
+    - name: Wait for Flannel pods to be Ready
+      shell: |
+        PODS=$(kubectl get pods -n kube-flannel -l app=flannel -o name)
+        if [ -n "$PODS" ]; then
+          kubectl wait --for=condition=Ready $PODS --timeout=300s
+        else
+          echo "No Flannel pods found yet, skipping wait"
+        fi
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: flannel_wait
+      changed_when: false
+      retries: 2
+      delay: 15
+      until: flannel_wait.rc == 0
+      ignore_errors: yes
+
+    - name: Restart CoreDNS pods to pick up the network
+      shell: |
+        kubectl delete pod -n kube-system -l k8s-app=kube-dns
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      ignore_errors: yes

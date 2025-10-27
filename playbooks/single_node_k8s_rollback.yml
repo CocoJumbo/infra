@@ -1,0 +1,92 @@
+- hosts: all
+  become: yes
+  tasks:
+
+    - name: Stop kubelet and Docker
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - kubelet
+        - docker
+      ignore_errors: yes
+
+    - name: Reset kubeadm (ignore errors)
+      command: kubeadm reset -f
+      ignore_errors: yes
+
+    - name: Remove Kubernetes packages
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: absent
+        purge: yes
+      ignore_errors: yes
+
+    - name: Unhold Kubernetes packages
+      command: apt-mark unhold kubelet kubeadm kubectl
+      ignore_errors: yes
+
+    - name: Remove Docker
+      apt:
+        name: docker.io
+        state: absent
+        purge: yes
+      ignore_errors: yes
+
+    - name: Remove Kubernetes directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /var/lib/etcd
+        - /var/lib/kubelet
+        - /var/lib/cni
+        - /etc/cni
+        - /run/flannel
+        - /opt/cni
+        - /root/.kube
+      ignore_errors: yes
+
+    - name: Remove Flannel and CNI network interfaces
+      shell: |
+        ip link delete cni0 || true
+        ip link delete flannel.1 || true
+      ignore_errors: yes
+
+    - name: Remove Kubernetes APT repo and keys
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/kubernetes.list
+        - /usr/share/keyrings/kubernetes-archive-keyring.gpg
+      ignore_errors: yes
+
+    - name: Clean apt cache
+      apt:
+        autoclean: yes
+        autoremove: yes
+        purge: yes
+
+    - name: Delete leftover crictl binary and tarball
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /usr/local/bin/crictl
+        - /tmp/crictl.tar.gz
+      ignore_errors: yes
+
+    - name: Restart networking services
+      systemd:
+        name: systemd-networkd
+        state: restarted
+      ignore_errors: yes
+
+    - name: Display cleanup completion
+      debug:
+        msg: "Kubernetes, Docker, and all related components have been removed. System is clean."

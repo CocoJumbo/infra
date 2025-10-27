@@ -1,0 +1,130 @@
+- hosts: all
+  become: yes
+  tasks:
+
+    # --- Kubernetes cleanup ---
+    - name: Reset kubeadm cluster
+      command: kubeadm reset -f
+      ignore_errors: yes
+
+    - name: Remove .kube directory from user
+      file:
+        path: "{{ ansible_env.HOME }}/.kube"
+        state: absent
+
+    - name: Remove Flannel CNI manifests and pods
+      shell: |
+        kubectl delete -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      ignore_errors: yes
+
+    # --- Remove Kubernetes packages ---
+    - name: Unhold Kubernetes packages
+      command: apt-mark unhold kubelet kubeadm kubectl
+      ignore_errors: yes
+
+    - name: Remove Kubernetes packages
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: absent
+        purge: yes
+
+    - name: Remove Kubernetes apt repository
+      file:
+        path: /etc/apt/sources.list.d/kubernetes.list
+        state: absent
+
+    - name: Remove Kubernetes apt key
+      file:
+        path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        state: absent
+
+    # --- Remove CRI-O ---
+    - name: Stop and disable CRI-O service
+      systemd:
+        name: crio
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+
+    - name: Remove CRI-O packages
+      apt:
+        name:
+          - cri-o
+          - cri-o-runc
+          - cri-tools
+        state: absent
+        purge: yes
+
+    - name: Remove CRI-O repositories
+      file:
+        path: "/etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list"
+        state: absent
+
+    - name: Remove CRI-O version repository
+      file:
+        path: "/etc/apt/sources.list.d/devel:kubic:libcontainers:stable:cri-o:1.25.list"
+        state: absent
+
+    - name: Remove CRI-O apt keys
+      file:
+        path: /etc/apt/trusted.gpg.d
+        state: absent
+        recurse: yes
+      ignore_errors: yes
+
+    # --- Remove CNI plugins ---
+    - name: Remove CNI plugin binaries
+      file:
+        path: /opt/cni/bin
+        state: absent
+
+    # --- Restore kernel parameters ---
+    - name: Remove Kubernetes sysctl configuration
+      file:
+        path: /etc/sysctl.d/k8s.conf
+        state: absent
+
+    - name: Reload sysctl
+      command: sysctl --system
+      ignore_errors: yes
+
+    - name: Remove kernel modules configuration for Kubernetes
+      file:
+        path: /etc/modules-load.d/k8s.conf
+        state: absent
+
+    # --- Unload kernel modules ---
+    - name: Remove overlay module
+      modprobe:
+        name: overlay
+        state: absent
+      ignore_errors: yes
+
+    - name: Remove br_netfilter module
+      modprobe:
+        name: br_netfilter
+        state: absent
+      ignore_errors: yes
+
+    # --- Restore swap ---
+    - name: Re-enable swap in /etc/fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^#\s*(.+\s+swap\s+.+)$'
+        replace: '\1'
+
+    - name: Enable swap
+      command: swapon -a
+      ignore_errors: yes
+
+
+    # --- Optional cleanup ---
+    - name: Clean apt cache
+      apt:
+        autoclean: yes
+        autoremove: yes

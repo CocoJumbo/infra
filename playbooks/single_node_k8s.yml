@@ -5,24 +5,58 @@
     - name: Disable swap
       command: swapoff -a
 
+    - name: Ensure swap is disabled on boot
+      replace:
+        path: /etc/fstab
+        regexp: '^\s*(.+\s+swap\s+.+)$'
+        replace: '# \1'
+
     - name: Install dependencies
       apt:
         name:
           - apt-transport-https
           - ca-certificates
           - curl
+          - socat
+          - conntrack
+          - ipset
+          - gnupg
         state: present
         update_cache: yes
 
-    - name: Add Kubernetes apt key
-      ansible.builtin.apt_key:
-        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+    - name: Install Docker
+      apt:
+        name: docker.io
         state: present
+        update_cache: yes
+
+    - name: Enable and start Docker
+      systemd:
+        name: docker
+        enabled: yes
+        state: started
+
+    - name: Download crictl
+      get_url:
+        url: https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.27.1/crictl-v1.27.1-linux-amd64.tar.gz
+        dest: /tmp/crictl.tar.gz
+
+    - name: Extract crictl
+      unarchive:
+        src: /tmp/crictl.tar.gz
+        dest: /usr/local/bin
+        remote_src: yes
+
+    - name: Add Kubernetes GPG key
+      shell: curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor -o /usr/share/keyrings/kubernetes-archive-keyring.gpg
+      args:
+        creates: /usr/share/keyrings/kubernetes-archive-keyring.gpg
 
     - name: Add Kubernetes apt repository
-      ansible.builtin.apt_repository:
-        repo: "deb https://apt.kubernetes.io/ kubernetes-xenial main"
-        state: present
+      lineinfile:
+        path: /etc/apt/sources.list.d/kubernetes.list
+        line: "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /"
+        create: yes
 
     - name: Update apt cache
       apt:
@@ -37,25 +71,81 @@
         state: present
 
     - name: Hold Kubernetes packages at current version
-      apt:
-        name:
-          - kubelet
-          - kubeadm
-          - kubectl
-        state: present
-        mark_hold: yes
+      command: apt-mark hold kubelet kubeadm kubectl
 
-    - name: Install Docker
-      apt:
-        name: docker.io
+    - name: Enable and start kubelet
+      systemd:
+        name: kubelet
+        enabled: yes
+        state: started
+
+    - name: Load br_netfilter module
+      modprobe:
+        name: br_netfilter
         state: present
-        update_cache: yes
+
+    - name: Ensure br_netfilter is loaded on boot
+      lineinfile:
+        path: /etc/modules-load.d/k8s.conf
+        line: br_netfilter
+        create: yes
+
+    - name: Enable bridge networking
+      sysctl:
+        name: net.bridge.bridge-nf-call-iptables
+        value: 1
+        state: present
+        reload: yes
+
+    - name: Enable bridge networking (IPv6)
+      sysctl:
+        name: net.bridge.bridge-nf-call-ip6tables
+        value: 1
+        state: present
+        reload: yes
+
+    - name: Reset kubeadm if previously initialized
+      command: kubeadm reset -f
+      ignore_errors: yes
+
+    - name: Stop kubelet
+      systemd:
+        name: kubelet
+        state: stopped
+
+    - name: Remove old manifests
+      file:
+        path: /etc/kubernetes/manifests
+        state: absent
+
+    - name: Recreate manifests directory
+      file:
+        path: /etc/kubernetes/manifests
+        state: directory
+        mode: 0755
+
+    - name: Remove etcd data
+      file:
+        path: /var/lib/etcd
+        state: absent
 
     - name: Initialize Kubernetes (only on master)
       command: kubeadm init --pod-network-cidr=10.244.0.0/16
       args:
         creates: /etc/kubernetes/admin.conf
       when: inventory_hostname in groups['masters']
+      register: kubeadm_init
+      retries: 3
+      delay: 30
+      until: kubeadm_init.rc == 0
+
+    - name: Ensure .kube directory exists
+      file:
+        path: "{{ ansible_env.HOME }}/.kube"
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
 
     - name: Set up kubeconfig for current user
       copy:
