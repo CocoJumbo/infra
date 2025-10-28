@@ -1,0 +1,8 @@
+volumeMounts:
+- name: rancher-data
+  mountPath: /var/lib/rancher
+volumes:
+- name: rancher-data
+  hostPath:
+    path: /opt/rancher-data
+    type: DirectoryOrCreate
